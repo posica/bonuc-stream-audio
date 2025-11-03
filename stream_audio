@@ -1,0 +1,159 @@
+#info@bonuc-sbc-telesale-org-roke:~$ cat /usr/share/freeswitch/scripts/stream_audio.py
+# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
+"""
+[FreeSWITCH mod_python3 stream_audio - AutoStop/Retry + Backoff 版]
+改良重點：
+ - ESL 自動重試 3 次 (含 backoff)
+ - uuid_audio_stream 若失敗自動重試
+ - 保留 AutoStop + Retry (bug already attached)
+ - 增強 debug log
+"""
+
+import json
+import time
+import threading
+import ESL
+
+try:
+    import freeswitch
+except ImportError:
+    freeswitch = None
+
+# === 設定區 ===
+ESL_HOST = "127.0.0.1"
+ESL_PORT = 8021
+ESL_PASS = "ClueCon"
+WS_URL = "ws://192.168.0.19:5000"
+
+MAX_ESL_RETRY = 3         # ESL 連線重試次數
+MAX_STREAM_RETRY = 3      # 音訊 attach 重試次數
+BACKOFF_BASE = 1          # Backoff 基準秒數 (1→2→4)
+DEBUG = True
+
+
+# === 基礎函式 ===
+def _log(level, msg):
+    prefix = f"[stream_audio][{level}] "
+    if freeswitch:
+        freeswitch.consoleLog(level, prefix + msg + "\n")
+    else:
+        print(prefix + msg)
+
+
+# === ESL 連線 (自動重試) ===
+def _connect_esl(max_retry=MAX_ESL_RETRY, backoff_base=BACKOFF_BASE):
+    for attempt in range(1, max_retry + 1):
+        conn = ESL.ESLconnection(ESL_HOST, ESL_PORT, ESL_PASS)
+        if conn.connected():
+            _log("INFO", f"✅ ESL 連線成功 (第 {attempt} 次)")
+            return conn
+        else:
+            delay = backoff_base ** attempt
+            _log("WARN", f"⚠️ ESL 連線失敗 (第 {attempt}/{max_retry} 次)，{delay}s 後重試...")
+            time.sleep(delay)
+    raise RuntimeError(f"❌ 無法連線到 ESL ({ESL_HOST}:{ESL_PORT}) after {max_retry} attempts")
+
+
+# === 核心串流動作 ===
+def _start_audio_stream(conn, session_uuid, metadata_json):
+    cmd = f"{session_uuid} start {WS_URL} stereo 8k {metadata_json}"
+    for attempt in range(1, MAX_STREAM_RETRY + 1):
+        _log("INFO", f"▶️ 嘗試啟動音訊串流 (第 {attempt}/{MAX_STREAM_RETRY} 次): {cmd}")
+        result = conn.api("uuid_audio_stream", cmd)
+        reply = result.getBody().strip()
+        _log("INFO", f"🎧 Response: {reply}")
+
+        if "OK" in reply or "started" in reply.lower():
+            _log("INFO", f"✅ 音訊串流啟動成功 (第 {attempt} 次)")
+            return True
+
+        if "bug already attached" in reply.lower():
+            _log("WARN", "⚙️ 偵測到 bug already attached，執行 stop → restart 流程")
+            conn.api("uuid_audio_stream", f"{session_uuid} stop")
+            time.sleep(1)
+            continue  # 重試 attach
+
+        delay = BACKOFF_BASE ** attempt
+        _log("WARN", f"⚠️ 啟動失敗，{delay}s 後重試...")
+        time.sleep(delay)
+
+    _log("ERR", "❌ 無法啟動音訊串流 (已達最大重試次數)")
+    return False
+
+
+# === 主執行邏輯 ===
+def _do_stream(session_uuid, trigger_source="unknown"):
+    try:
+        _log("INFO", f"🟡 進入 _do_stream(UUID={session_uuid}, 來源={trigger_source})")
+
+        conn = _connect_esl()
+        exists = conn.api("uuid_exists", session_uuid).getBody().strip()
+        if exists != "true":
+            _log("WARN", f"⚠️ UUID {session_uuid} 不存在，略過串流。")
+            return
+
+        callstate = conn.api("uuid_getvar", f"{session_uuid} callstate").getBody().strip()
+        ch_state = conn.api("uuid_getvar", f"{session_uuid} channel_state").getBody().strip()
+        _log("INFO", f"🔍 callstate={callstate}, channel_state={ch_state}")
+
+        # --- buglist 偵測 ---
+        buglist = conn.api("uuid_buglist", session_uuid).getBody().strip()
+        if "mod_audio_stream" in buglist:
+            _log("WARN", "⚙️ 已偵測到舊的 mod_audio_stream bug，先行停止中...")
+            stop_resp = conn.api("uuid_audio_stream", f"{session_uuid} stop").getBody().strip()
+            _log("INFO", f"🛑 Stop response: {stop_resp}")
+            time.sleep(1)
+
+        # metadata
+        caller_num = conn.api("uuid_getvar", f"{session_uuid} caller_id_number").getBody().strip() or "unknown"
+        metadata = {
+            "call_id": session_uuid,
+            "language": "zh-TW",
+            "caller_number": caller_num,
+            "timestamp": int(time.time())
+        }
+        metadata_json = json.dumps(metadata, ensure_ascii=False)
+
+        # 啟動音訊串流
+        _start_audio_stream(conn, session_uuid, metadata_json)
+
+    except Exception as e:
+        _log("ERR", f"Exception in _do_stream: {e}")
+
+
+# === FreeSWITCH handler ===
+def handler(session, args):
+    try:
+        session_uuid = args.strip() if args else session.get_uuid()
+        _log("INFO", f"📞 handler 觸發，UUID={session_uuid}")
+        threading.Thread(target=_do_stream, args=(session_uuid, "dialplan"), daemon=True).start()
+    except Exception as e:
+        _log("ERR", f"handler exception: {e}")
+
+
+# === CLI/FSAPI 呼叫入口 ===
+def fsapi(session, stream, env, args):
+    _log("INFO", f"💻 fsapi 被呼叫，args={args}")
+    if not args:
+        msg = "❌ 缺少 UUID，例如：fs_cli -x 'python stream_audio <uuid>'"
+        _log("ERR", msg)
+        stream.write(msg + "\n")
+        return
+
+    threading.Thread(target=_do_stream, args=(args.strip(), "fsapi"), daemon=True).start()
+    stream.write("+OK stream_audio background started\n")
+
+
+_log("NOTICE", "✅ stream_audio.py 已載入（AutoStop + Retry + Backoff 強化版 for FS 1.10.x）")
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("用法：python3 stream_audio.py <uuid>")
+        sys.exit(1)
+    uuid = sys.argv[1]
+    _log("INFO", f"🧪 手動測試模式啟動，UUID={uuid}")
+    threading.Thread(target=_do_stream, args=(uuid, "manual"), daemon=True).start()
+    time.sleep(2)
+    _log("INFO", "✅ 背景任務已啟動。")
